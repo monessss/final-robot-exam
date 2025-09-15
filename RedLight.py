@@ -25,14 +25,14 @@ class RedLightController:
     # ========= 你的原参数（保持不变） =========
     PITCH_ANGLE = -50
     GREEN_RECENTER_DELAY = 1.0
-    YAW_MAX_SPEED_DEG_S = 80.0
-    PITCH_MAX_SPEED_DEG_S = 60.0
-    TOL_NORM_X = 0.03
-    TOL_NORM_Y = 0.03
+    YAW_MAX_SPEED_DEG_S = 120.0
+    PITCH_MAX_SPEED_DEG_S = 90.0
+    TOL_NORM_X = 0.05
+    TOL_NORM_Y = 0.05
 
-    areaMin = 5000
+    areaMin = 1500
     AREA_MAX = 70000
-    GREEN_AREA_MIN = 1200
+    GREEN_AREA_MIN = 1100
 
     R1_H_lo, R1_H_hi = 0, 10
     R1_S_lo, R1_S_hi = 120, 255
@@ -44,13 +44,17 @@ class RedLightController:
 
     G_H_lo, G_H_hi = 35, 85
     G_S_lo, G_S_hi = 80, 255
-    G_V_lo, G_V_hi = 60, 255
+    G_V_lo, G_V_hi = 55, 255
 
     KERNEL_SIZE = 5
 
+    JPEG_QUALITY = 85  # 85% 画质，IO更快
+    BURST_SHOTS = 2  # 连拍 2 张
+    BURST_INTERVAL = 0.06
+
     # ========= 新增的内部细化参数（不改你的原值） =========
     # 仅用于“拍照完成后的等待时间”缩短比例（不改变 GREEN_RECENTER_DELAY 本身）
-    _POST_SHOT_DELAY_SCALE = 0.6  # 例如把 1.0s 等效为 0.6s；需要再快可改这个比例
+    _POST_SHOT_DELAY_SCALE = 0.3  # 例如把 1.0s 等效为 0.6s；需要再快可改这个比例
 
     def __init__(self, show_debug=True):
         self.show_debug = show_debug
@@ -137,14 +141,16 @@ class RedLightController:
 
     # ========== 异步拍照 ==========
     def _save_photo(self, frame, tag="RED"):
-        """后台线程执行：保存图片到 ./shots"""
         try:
             os.makedirs(self.SAVE_DIR, exist_ok=True)
-            ts = time.strftime("%Y%m%d_%H%M%S")
-            ms = int((time.time() % 1) * 1000)
-            path = os.path.join(self.SAVE_DIR, f"{tag}_{ts}_{ms:03d}.jpg")
-            ok = cv2.imwrite(path, frame)
-            print(f"[RedLight] 拍照{'成功' if ok else '失败'}：{path}")
+            for k in range(self.BURST_SHOTS):
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                ms = int((time.time() % 1) * 1000)
+                path = os.path.join(self.SAVE_DIR, f"{tag}_{ts}_{ms:03d}_{k + 1}.jpg")
+                ok = cv2.imwrite(path, frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(self.JPEG_QUALITY)])
+                print(f"[RedLight] 拍照{'成功' if ok else '失败'}：{path}")
+                if k + 1 < self.BURST_SHOTS:
+                    time.sleep(self.BURST_INTERVAL)
         except Exception as e:
             print("[RedLight] 保存照片异常：", e)
 
@@ -199,7 +205,7 @@ class RedLightController:
                 cx, cy = rc
                 aligned = self._aim_gimbal_to(cx, cy, W, H)
                 # 放宽拍照门槛（仅用于拍照，不改变云台停转阈值）
-                if (aligned or self._is_aligned(cx, cy, W, H, scale=1.5)) and not self._shot_red:
+                if (aligned or self._is_aligned(cx, cy, W, H, scale=2.0)) and not self._shot_red:
                     if self._shoot_async(frame, tag="RED"):
                         self._shot_red = True
             else:
@@ -267,11 +273,12 @@ class RedLightController:
         - 主色占优（want='red'→red>=green；'green'→green>=red）
         """
         H, W = frame_shape[:2]
+        dyn_min = max(self.areaMin, int(0.001 * W * H))
         outs = []
         contours, _ = cv2.findContours(mask_all, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if area < self.areaMin or area >= self.AREA_MAX:
+            if area < dyn_min or area >= self.AREA_MAX:
                 continue
 
             peri = cv2.arcLength(cnt, True)
