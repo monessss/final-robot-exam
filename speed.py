@@ -1,3 +1,5 @@
+#此程序是竞速的最终版本。同时具有直角转弯的功能
+
 import cv2
 import numpy as np
 import robomaster
@@ -154,3 +156,4 @@ if __name__ == '__main__':
         ep_camera.stop_video_stream()
         cv2.destroyAllWindows()
         ep_robot.close()
+
