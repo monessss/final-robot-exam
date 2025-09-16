@@ -163,7 +163,7 @@ def init_robot():
 
     # 注入 RedLightController（不二次连接）
     global redlight_ctrl
-    redlight_ctrl = RedLightController(show_debug=False)  # 统一窗口显示，这里关闭内部窗口
+    redlight_ctrl = RedLightController(show_debug=True)  # 统一窗口显示，这里关闭内部窗口
     redlight_ctrl.ep = ep_robot
     redlight_ctrl.ep_gimbal = ep_gimbal
     redlight_ctrl.ep_camera = ep_camera
@@ -227,9 +227,9 @@ def reset_line_state_after_green(ep_robot, ep_gimbal):
     ep_robot.set_robot_mode(mode='chassis_lead')
     try:
         ep_gimbal.recenter(pitch_speed=60, yaw_speed=60).wait_for_completed()
-        time.sleep(0.3)
+        time.sleep(0.1)
         ep_gimbal.move(pitch=PITCH_ANGLE, yaw=0, pitch_speed=30, yaw_speed=30).wait_for_completed()
-        time.sleep(0.3)
+        time.sleep(0.1)
     except Exception as e:
         rate.log("rl_warn_restore", f"[WARN] 恢复巡线时云台设置异常：{e}", 2.0)
 
@@ -270,8 +270,7 @@ def handle_redlight_flow(ep_robot, ep_chassis, ep_gimbal):
             rate.log("rl_exit", "[绿灯] RedLight 流程结束，准备恢复巡线（回正+低头）...", 1.0)
             break
 
-    # —— 恢复巡线：不重开视频流，其它与程序开始一致 ——
-    reset_line_state_after_green(ep_robot, ep_gimbal)
+
 
 # =============== 主流程（融合 Obstacle Follow + 性能优化） ===============
 if __name__ == '__main__':
@@ -345,7 +344,6 @@ if __name__ == '__main__':
 
                 # 阻塞运行红灯流程
                 handle_redlight_flow(ep_robot, ep_chassis, ep_gimbal)
-
                 # 恢复巡线姿态 + 清一次障碍缓存（确保视角回地、避免刚恢复就被旧框拉停）
                 reset_line_state_after_green(ep_robot, ep_gimbal)
 
@@ -353,7 +351,7 @@ if __name__ == '__main__':
                 line_following_enabled = True
 
                 # 红灯退出后 1.5s 内忽略红灯判定，避免“刚退出又触发”
-                t_ignore_red_until = time.time() + 1.5
+                t_ignore_red_until = time.time() + 1.2
 
                 # 重置一些回归用状态（可选）
                 prev_obs_stage = "NORMAL"
