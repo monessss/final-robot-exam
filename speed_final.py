@@ -1,4 +1,6 @@
-# -*- coding: utf-8 -*-
+# 此版本为20小组的小车竞速最终版本
+#20组在2025年9月17日的小车竞速项目中以12.59秒的成绩斩获第一名，远超第二。
+#感谢所有对二十组提供帮助的人，在次，我谨代表二十组全体成员感谢你们。
 import cv2
 import numpy as np
 import robomaster
@@ -172,3 +174,4 @@ if __name__ == '__main__':
         ep_camera.stop_video_stream()
         cv2.destroyAllWindows()
         ep_robot.close()
+
