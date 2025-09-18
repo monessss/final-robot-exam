@@ -85,6 +85,9 @@ class RedLightController:
     # ========== 生命周期 ==========
     def start(self, conn_type="ap"):
         """连接机器人、设模式（去重）、回正+低头、开启视频流。"""
+        if self.ep is not None and self.ep_camera is not None:
+            # 已由主程序注入，不再二次连接/开流
+            return
         self.ep = robot.Robot()
         self.ep.initialize(conn_type=conn_type)
         self.ep_gimbal = self.ep.gimbal
@@ -130,6 +133,7 @@ class RedLightController:
         try:
             self.ep.set_robot_mode(mode=mode_name)
             self._current_mode = mode_name
+            time.sleep(0.08)
         except Exception:
             # 兼容写法（主要是 gimbal_lead 常量）
             try:
@@ -232,6 +236,12 @@ class RedLightController:
                         else:
                             if time.time() - self._t_green_post_start >= (self.GREEN_RECENTER_DELAY * self._POST_SHOT_DELAY_SCALE):
                                 # 拍照完成 + 拍后延时到点 → 交还控制权（mode_state=3）
+                                # 在 step() 里，准备把 mode_state=3 之前：
+                                try:
+                                    self.ep_gimbal.drive_speed(pitch_speed=0, yaw_speed=0)
+                                except Exception:
+                                    pass
+                                # 然后再把 self.mode_state = 3
                                 self.mode_state = 3
                                 self._t_green_post_start = None
                     # 若尚未完成保存：持续等待（不进入延时计时）
@@ -358,14 +368,14 @@ class RedLightController:
 
         if draw is not None:
             for cnt, x, y, w, h, area in green_targets:
-                cv2.drawContours(draw, cnt, -1, (0, 255, 0), 7)
+                cv2.drawContours(draw, [cnt], -1, (0, 255, 0), 7)
                 cv2.rectangle(draw, (x, y), (x + w, y + h), (0, 255, 0), 5)
                 cv2.putText(draw, "Points: 8", (x + w + 20, y + 20),
                             cv2.FONT_HERSHEY_COMPLEX, .7, (0,255,0), 2)
                 cv2.putText(draw, f"Area: {int(area)}", (x + w + 20, y + 45),
                             cv2.FONT_HERSHEY_COMPLEX, 0.7, (0,255,0), 2)
             for cnt, x, y, w, h, area in red_targets:
-                cv2.drawContours(draw, cnt, -1, (255, 0, 255), 7)
+                cv2.drawContours(draw, [cnt], -1, (255, 0, 255), 7)
                 cv2.rectangle(draw, (x, y), (x + w, y + h), (0, 0, 255), 5)
                 cv2.putText(draw, "Points: 8", (x + w + 20, y + 20),
                             cv2.FONT_HERSHEY_COMPLEX, .7, (0,255,0), 2)
