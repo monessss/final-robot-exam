@@ -65,8 +65,10 @@ class MarkerCaptureManager:
                  min_yaw_dps: float = 5.0,
                  deadband_dps: float = 1.0,
                  dir_yaw: float = +1.0,             # 方向反了可以改成 -1
-                 smooth_alpha: float = 0.35,        # 轨迹 EMA 平滑
-                 track_hold_sec: float = 0.30,      # 轨迹保留
+                 smooth_alpha: float = 0.35,  # 轨迹 EMA 平滑
+                 track_hold_sec: float = 1.20,
+                 lock_min_dwell: float = 1.00,
+                 lost_grace_sec: float = 0.80,  # ↑ 丢失宽限（0.8s 内不换目标）
                  # —— 拍照/回正 ——
                  pre_capture_delay: float = 0.50,
                  recenter_after_capture: bool = True,
@@ -121,7 +123,9 @@ class MarkerCaptureManager:
         self.show_debug = show_debug
         self.window_name = window_name
         self.valid_id_range = valid_id_range
-
+        self.lock_min_dwell = float(lock_min_dwell)
+        self.lost_grace_sec = float(lost_grace_sec)
+        self._lock_since: float = 0.0  # 当前这次锁定起始时间
         # 跟随/状态量
         self.gimbal_yaw: Optional[float] = None
         self.gimbal_pitch: Optional[float] = None
@@ -270,7 +274,8 @@ class MarkerCaptureManager:
                     continue
                 with self._tracks_lock:
                     if mid not in self._tracks:
-                        self._tracks[mid] = {'x': x, 'y': y, 'w': w, 'h': h, 'ts': now}
+                        self._tracks[mid] = {'x': x, 'y': y, 'w': w, 'h': h,
+                                             'ts': now, 'first_ts': now}
                     else:
                         t = self._tracks[mid]
                         a = self.smooth_alpha
@@ -278,7 +283,7 @@ class MarkerCaptureManager:
                         t['y'] = a * y + (1 - a) * t['y']
                         t['w'] = a * w + (1 - a) * t['w']
                         t['h'] = a * h + (1 - a) * t['h']
-                        t['ts'] = now
+                        t['ts'] = now  # 保留 first_ts 不变（用于“第一个出现”的判断）
         except Exception:
             pass
 
@@ -307,23 +312,38 @@ class MarkerCaptureManager:
         return stable
 
     def _choose_target(self, stable: List[MarkerInfo]) -> Optional[MarkerInfo]:
-        # 忽略已拍 ID
+        now = time.time()
+        # 1) 过滤：已拍/距离（只取候选）
         candidates = [m for m in stable if int(m.mid) not in self._captured_ids]
-        # 近距离门槛（用于触发拍照/候选选择）
         if self.only_near:
             candidates = [m for m in candidates if m.w >= self.near_width_min]
-        # 粘性：优先锁定目标
+
+        # 2) 若当前有锁：
         if self._locked_id is not None:
+            # 2.1 锁定 ID 仍在候选里 → 继续保持（更新时间戳）
             for m in candidates:
                 if int(m.mid) == int(self._locked_id):
-                    self._last_lock_ts = time.time()
+                    self._last_lock_ts = now
+                    # 未达到最小占用时长前，无条件继续使用该目标
                     return m
+            # 2.2 锁定 ID 暂不在候选里 → 宽限时间内不换目标
+            if (now - self._last_lock_ts) <= self.lost_grace_sec:
+                return None
+            # 2.3 超过宽限 → 允许重新选择
+            self._locked_id = None
+
+        # 3) 没有锁或锁失效：按“first_ts 最早（第一个出现）”选择
         if not candidates:
             return None
-        # 最近原则（距离中心 0.5 最近）
-        m = min(candidates, key=lambda k: abs(k.x - 0.5))
+
+        def first_ts_of(mid: int) -> float:
+            t = self._tracks.get(int(mid), {})
+            return t.get('first_ts', float('inf'))
+
+        m = min(candidates, key=lambda k: first_ts_of(k.mid))
         self._locked_id = int(m.mid)
-        self._last_lock_ts = time.time()
+        self._lock_since = now
+        self._last_lock_ts = now
         return m
 
     def _ready_for_capture(self, target: MarkerInfo) -> bool:
@@ -455,7 +475,7 @@ class MarkerCaptureManager:
             cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
             cx, cy = int(m.x * w), int(m.y * h)
             cv2.circle(img, (cx, cy), 4, color, -1)
-            label = f"ID {m.mid} w={m.w:.2f}"
+            label = f"Team 20 detect a marker with ID {m.mid} w={m.w:.2f}"
             cv2.putText(img, label, (x1, max(18, y1-6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         # 中心十字
         cx = int(0.5 * w); cy = int(0.5 * h)
