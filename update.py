@@ -163,6 +163,7 @@ def reset_line_state_after_green(ep_robot, ep_gimbal):
     """
     try:
         ep_robot.set_robot_mode(mode='chassis_lead')
+        time.sleep(1.5)
     except Exception as e:
         rate.log("mode_warn", f"[WARN] 设置 chassis_lead 异常：{e}", 2.0)
 
@@ -206,6 +207,7 @@ def handle_redlight_flow(ep_robot, ep_chassis, ep_gimbal):
 
         if mode_state == 3:
             rate.log("rl_exit", "[绿灯] RedLight 流程结束，准备统一复位...", 1.0)
+
             break
 
 # =============== Marker 阻塞流程（立刻停车→只动云台） ===============
@@ -261,15 +263,40 @@ def handle_marker_flow(ep_robot, ep_chassis, ep_gimbal, marker_mgr, ep_camera):
 
         if save_path is not None:
             print(f"[marker] 本轮拍照完成：{os.path.basename(save_path)}")
-            # 清掉云台速度更干净
             try:
                 ep_gimbal.drive_speed(pitch_speed=0, yaw_speed=0)
             except Exception:
                 pass
+
+            # ▶▶ 新增：等待 Marker 内部“拍后回正”线程结束（最多 recenter_timeout+0.5s）
+            try:
+                t0 = time.time()
+                cap_timeout = getattr(marker_mgr, "recenter_timeout", 3.0) + 0.5
+                while getattr(marker_mgr, "_cap_active", False) and time.time() - t0 < cap_timeout:
+                    # 保证底盘静止，避免误动
+                    try:
+                        ep_chassis.drive_speed(x=0, y=0, z=0, timeout=0.2)
+                    except Exception:
+                        pass
+                    time.sleep(0.05)
+                # 若订阅了角度，可再等到 yaw 接近 0（1 秒兜底）
+                gyaw = getattr(marker_mgr, "gimbal_yaw", None)
+                tol = getattr(marker_mgr, "recenter_tol_deg", 2.0)
+                if gyaw is not None:
+                    t1 = time.time()
+                    while abs(getattr(marker_mgr, "gimbal_yaw", gyaw)) > tol and time.time() - t1 < 1.0:
+                        time.sleep(0.05)
+            except Exception as e:
+                print(f"[marker] 等待内部回正结束异常: {e}")
+
             break
 
-    # 统一复位（回正+低头+切回 chassis_lead）
-    reset_line_state_after_green(ep_robot, ep_gimbal)
+
+    try:
+        marker_mgr._locked_id = None
+        marker_mgr._cooldown_until = time.time() + 1.0
+    except Exception:
+        pass
 
 # =============== 主流程 ===============
 if __name__ == '__main__':
@@ -306,7 +333,7 @@ if __name__ == '__main__':
         center_tol=0.05,
         width_thresh_norm=0.10,
         kp_yaw=0.5, max_yaw_dps=60.0,
-        recenter_after_capture=True,
+        recenter_after_capture=False,
         miss_restart=999999,
         save_dir=SHOOT_DIR
     )
@@ -354,7 +381,7 @@ if __name__ == '__main__':
 
                 handle_redlight_flow(ep_robot, ep_chassis, ep_gimbal)
                 reset_line_state_after_green(ep_robot, ep_gimbal)
-
+                time.sleep(1.2)
                 # 重新允许巡线，并在短时间内忽略红灯，避免立刻复触发
                 line_following_enabled = True
                 t_ignore_red_until = time.time() + 1.2
@@ -388,6 +415,8 @@ if __name__ == '__main__':
                     line_following_enabled = False
 
                     handle_marker_flow(ep_robot, ep_chassis, ep_gimbal, marker_mgr, ep_camera)
+                    reset_line_state_after_green(ep_robot, ep_gimbal)
+                    time.sleep(1.2)
                     line_following_enabled = True
                     t_ignore_red_until = time.time() + 1.2
                     continue

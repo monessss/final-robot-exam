@@ -196,7 +196,7 @@ class RedLightController:
 
         if s == 0:
             # 红灯：切 free（去重），仅云台转动
-            self._set_mode("free")
+            self._set_mode("chassis_lead")
 
             if self.mode_state != 0:
                 self.mode_state = 0
