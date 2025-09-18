@@ -164,6 +164,29 @@ def read_newest(cam, timeout=0.3):
     except TypeError:
         return cam.read_cv2_image(timeout=timeout)                     # 兼容旧版
 
+class FrameGrabber:
+    """优先 newest；失败多次用上一帧兜底，避免空帧打断 marker 识别/跟随。"""
+    def __init__(self, cam):
+        self.cam = cam
+        self.last = None
+
+    def grab(self, retries=3, timeout=0.07, allow_last=True):
+        for _ in range(max(1, retries)):
+            f = read_newest(self.cam, timeout=timeout)
+            if f is not None:
+                self.last = f
+                return f
+        # newest 仍为空 → 回退上一帧（可选）
+        if allow_last and self.last is not None:
+            return self.last
+        return None
+
+    def flush(self, n=4, timeout=0.03):
+        """读取并丢弃 n 帧，用于拍照后冲刷相机缓冲。"""
+        for _ in range(max(0, n)):
+            _ = read_newest(self.cam, timeout=timeout)
+                    # 兼容旧版
+
 # =============== 蓝线检测（下半 ROI） ===============
 def detect_blue_line(img_bgr):
     H, W = img_bgr.shape[:2]
@@ -250,10 +273,10 @@ def handle_marker_flow(ep_robot, motion: MotionSmoother, marker_mgr, ep_camera):
     save_path = None
     idle_frames = 0
     while True:
-        frame = read_newest(ep_camera, timeout=0.3)
+        frame = grabber.grab(retries=3, timeout=0.06, allow_last=True)
         if frame is None:
             motion.soft_stop()
-            rate.log("mk_frame", "[marker] 读取帧为空", 0.5)
+            rate.log("mk_frame", "[marker] 暂无可用帧", 0.5)
             continue
 
         try:
@@ -299,9 +322,7 @@ def handle_marker_flow(ep_robot, motion: MotionSmoother, marker_mgr, ep_camera):
                 print(f"[marker] 等待内部回正结束异常: {e}")
             # ▶ 冲刷相机缓冲，避免旧帧带来巨大的首次偏差
             try:
-                for _ in range(5):  # 读掉 ~5 帧
-                    _ = read_newest(ep_camera, timeout=0.05)
-                    motion.soft_stop()  # 同时保持柔性停
+                grabber.flush(n=5, timeout=0.02)
             except Exception:
                 pass
 
@@ -323,6 +344,7 @@ if __name__ == '__main__':
 
     # 初始化
     ep_robot, ep_camera, ep_chassis, ep_gimbal, ep_vision = init_robot()
+    grabber = FrameGrabber(ep_camera)
     motion = MotionSmoother(ep_chassis, x_slew=0.15, z_slew=40.0, timeout=0.12)
 
     # 启动相机
@@ -343,7 +365,7 @@ if __name__ == '__main__':
         center_tol=0.05, width_thresh_norm=0.10,
         kp_yaw=0.5, max_yaw_dps=60.0,
         recenter_after_capture=False, miss_restart=999999,
-        save_dir=SHOOT_DIR
+        save_dir=SHOOT_DIR,min_area_px=10000
     )
     try:
         marker_mgr.subscribe()
@@ -367,9 +389,10 @@ if __name__ == '__main__':
     try:
         while True:
             # 取帧
-            frame = ep_camera.read_cv2_image(timeout=0.3)
+            frame = grabber.grab(retries=3, timeout=0.06, allow_last=True)
             if frame is None:
-                rate.log("cam_empty", "[camera] 空帧", 1.0)
+                # 极端情况下连“上一帧”也没有（刚上电/流断），先保持柔性停并继续尝试
+                rate.log("cam_empty", "[camera] 暂无可用帧（newest/last 均为空）", 1.0)
                 motion.soft_stop()
                 continue
 
@@ -395,10 +418,6 @@ if __name__ == '__main__':
 
                 handle_redlight_flow(ep_robot, motion)
                 reset_line_state_after_green(ep_robot, ep_gimbal)
-                for _ in range(5):
-                    _ = read_newest(ep_camera, timeout=0.05)
-                motion.hard_zero()  # 将平滑器内部状态清零（此时本来就停着，不算“急停”）
-                lf_warmup_until = time.monotonic() + 0.25  # 记录 0.25s 暖机期（见③）
                 line_following_enabled = True
                 t_ignore_red_until = time.time() + 1.2
                 continue
