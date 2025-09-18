@@ -6,7 +6,8 @@ import cv2
 import numpy as np
 import os
 from robomaster import robot
-
+from collections import deque
+import math
 # ======= 控制器（保持你现有的工具类）=======
 from RedLight import RedLightController      # 工具类内部红灯时会切 free
 from marker import MarkerCaptureManager      # 工具类 step 内只驱动云台 yaw
@@ -28,12 +29,12 @@ PANEL_W, PANEL_H = 960, 360
 line_following_enabled = True
 
 # >>> 断线寻找（探前→扫描）参数 —— 低优先级
-SEARCH_YAW_DPS       = 70.0
+SEARCH_YAW_DPS       = 45.0
 SEARCH_SWEEP_DEG     = 120.0
 FOUND_STABLE_FRAMES  = 2
 SEARCH_SEG_TIME      = SEARCH_SWEEP_DEG / abs(SEARCH_YAW_DPS)
-PROBE_FWD_TIME       = 0.8
-PROBE_FWD_SPEED      = 0.2
+PROBE_FWD_TIME       = 0.1
+PROBE_FWD_SPEED      = 0.1
 
 # —— 柔性速度控制（替代急停）——
 class MotionSmoother:
@@ -123,6 +124,21 @@ def dump_marker_diag(marker_mgr, stage_hint=""):
                   "则 _stable_markers() 返回空集，step() 将一直是 IDLE。")
     except Exception as e:
         print(f"[MK-DIAG] dump 异常：{e}")
+def estimate_line_theta_deg(mask, sample_stride=2, min_pts=300):
+    """
+    返回蓝线相对“竖直向上”的倾角 θ（度，右倾为正、左倾为负）；失败返回 None
+    - 使用 fitLine 对线像素点做鲁棒直线拟合，vx, vy 是方向向量
+    - 图像坐标 y 向下，因此相对“竖直向上”的角度 = atan2(vx, -vy)
+    """
+    ys, xs = np.where(mask > 0)
+    if xs.size < min_pts:
+        return None
+    pts = np.column_stack((xs[::sample_stride], ys[::sample_stride])).astype(np.float32)
+    vx, vy, x0, y0 = cv2.fitLine(pts, cv2.DIST_L2, 0, 0.01, 0.01)
+    vx, vy = float(vx), float(vy)
+    theta = math.degrees(math.atan2(vx, -vy))
+    # 常见范围：[-45°, 45°]，值越大“向上越往右偏”
+    return theta
 
 # =============== 初始化（不订阅/不使用避障） ===============
 def init_robot():
@@ -158,34 +174,63 @@ def init_robot():
     if hasattr(redlight_ctrl, "detect_state"): redlight_ctrl.detect_state = 3
 
     return ep_robot, ep_camera, ep_chassis, ep_gimbal, ep_vision
-def read_newest(cam, timeout=0.3):
+
+def read_newest(cam, timeout=0.12):
+    """优先 newest；遇到任意异常都返回 None（不让异常冒出主循环）"""
     try:
-        return cam.read_cv2_image(strategy="newest", timeout=timeout)  # 若 SDK 支持
-    except TypeError:
-        return cam.read_cv2_image(timeout=timeout)                     # 兼容旧版
+        return cam.read_cv2_image(strategy="newest", timeout=timeout)
+    except Exception:
+        try:
+            # 退化到默认策略再试一次
+            return cam.read_cv2_image(timeout=timeout)
+        except Exception:
+            return None
+                   # 兼容旧版
 
 class FrameGrabber:
-    """优先 newest；失败多次用上一帧兜底，避免空帧打断 marker 识别/跟随。"""
-    def __init__(self, cam):
+    """统一相机取帧入口：优先 newest；失败返回上一帧；带流看门狗。"""
+    def __init__(self, cam, restart_thresh=40, restart_cooldown=2.0):
         self.cam = cam
         self.last = None
+        self.empty_count = 0
+        self._last_restart = 0.0
+        self._restart_thresh = int(restart_thresh)          # 连续空帧多少次触发重启（40≈4~5秒）
+        self._restart_cooldown = float(restart_cooldown)    # 两次重启之间的最小间隔（秒）
 
-    def grab(self, retries=3, timeout=0.07, allow_last=True):
+    def _maybe_restart_stream(self):
+        now = time.monotonic()
+        if self.empty_count >= self._restart_thresh and (now - self._last_restart) > self._restart_cooldown:
+            try:
+                print("[cam] 连续空帧过多，重启视频流…")
+                self.cam.stop_video_stream()
+            except Exception:
+                pass
+            time.sleep(0.2)
+            try:
+                self.cam.start_video_stream(display=False)
+                self._last_restart = time.monotonic()
+            except Exception:
+                pass
+            # 重启后清空计数
+            self.empty_count = 0
+
+    def grab(self, retries=2, timeout=0.10, allow_last=True):
+        """返回最新帧；若失败若干次则回退到上一帧；绝不抛异常。"""
         for _ in range(max(1, retries)):
             f = read_newest(self.cam, timeout=timeout)
             if f is not None:
                 self.last = f
+                self.empty_count = 0
                 return f
-        # newest 仍为空 → 回退上一帧（可选）
+            else:
+                self.empty_count += 1
+        # 读不到 → 看门狗尝试重启；再回退上一帧（如允许）
+        self._maybe_restart_stream()
         if allow_last and self.last is not None:
             return self.last
         return None
 
-    def flush(self, n=4, timeout=0.03):
-        """读取并丢弃 n 帧，用于拍照后冲刷相机缓冲。"""
-        for _ in range(max(0, n)):
-            _ = read_newest(self.cam, timeout=timeout)
-                    # 兼容旧版
+
 
 # =============== 蓝线检测（下半 ROI） ===============
 def detect_blue_line(img_bgr):
@@ -257,6 +302,19 @@ def handle_redlight_flow(ep_robot, motion: MotionSmoother):
         if mode_state == 3:
             rate.log("rl_exit", "[绿灯] RedLight 流程结束，准备统一复位...", 1.0)
             break
+def pick_first_sweep_dir():
+    """
+    返回初始旋转方向：+1 表示左转(z>0)，-1 表示右转(z<0)
+    优先用近几帧“线倾角”中位数；不够时用最近的底盘yaw指令中位数；都没有默认右转(-1)。
+    需已维护：theta_hist（近帧倾角），yaw_send_hist（近帧实际z指令）
+    """
+    if len(theta_hist) >= 3:
+        m = float(np.median(theta_hist))
+        return -1 if m > 0 else +1    # θ>0 说明线“向上偏右”，先右转更容易命中
+    if len(yaw_send_hist) >= 3:
+        m = float(np.median(yaw_send_hist))
+        return +1 if m > 0 else -1    # 用最近转向作为兜底
+    return -1
 
 # =============== Marker 阻塞流程（改为“快速减速至停”） ===============
 def handle_marker_flow(ep_robot, motion: MotionSmoother, marker_mgr, ep_camera):
@@ -273,7 +331,7 @@ def handle_marker_flow(ep_robot, motion: MotionSmoother, marker_mgr, ep_camera):
     save_path = None
     idle_frames = 0
     while True:
-        frame = grabber.grab(retries=3, timeout=0.06, allow_last=True)
+        frame = grabber.grab(retries=3, timeout=0.12, allow_last=True)
         if frame is None:
             motion.soft_stop()
             rate.log("mk_frame", "[marker] 暂无可用帧", 0.5)
@@ -305,12 +363,11 @@ def handle_marker_flow(ep_robot, motion: MotionSmoother, marker_mgr, ep_camera):
             except Exception:
                 pass
 
-            # 等待 Marker 内部“拍后回正”线程结束
+            # 等待 Marker 内部“拍后回正”线程结束（不再刷帧、不做暖机）
             try:
                 t0 = time.time()
                 cap_timeout = getattr(marker_mgr, "recenter_timeout", 3.0) + 0.5
                 while getattr(marker_mgr, "_cap_active", False) and time.time() - t0 < cap_timeout:
-                    motion.soft_stop()
                     time.sleep(0.05)
                 gyaw = getattr(marker_mgr, "gimbal_yaw", None)
                 tol  = getattr(marker_mgr, "recenter_tol_deg", 2.0)
@@ -320,11 +377,6 @@ def handle_marker_flow(ep_robot, motion: MotionSmoother, marker_mgr, ep_camera):
                         time.sleep(0.05)
             except Exception as e:
                 print(f"[marker] 等待内部回正结束异常: {e}")
-            # ▶ 冲刷相机缓冲，避免旧帧带来巨大的首次偏差
-            try:
-                grabber.flush(n=5, timeout=0.02)
-            except Exception:
-                pass
 
             break
 
@@ -364,9 +416,17 @@ if __name__ == '__main__':
         only_near=True, near_width_min=0.10, track_width_min=0.06,
         center_tol=0.05, width_thresh_norm=0.10,
         kp_yaw=0.5, max_yaw_dps=60.0,
-        recenter_after_capture=False, miss_restart=999999,
-        save_dir=SHOOT_DIR,min_area_px=10000
+        recenter_after_capture=False, miss_restart=120, save_dir=SHOOT_DIR,
+        # ↓↓↓ 新增
+        min_switch_interval_s=0.6,
+        area_switch_hysteresis=1.2,
+        capture_deadline_s=1.2,
+        force_capture_if_near=True
     )
+
+    # 关键：Marker 的拍照线程也走统一入口（不会抛异常）
+    marker_mgr.read_frame = lambda timeout=None: grabber.grab(retries=1, timeout=(timeout or 0.12), allow_last=True)
+
     try:
         marker_mgr.subscribe()
         print("[marker] subscribe 完成（注意：若不向 _tracks 写数据将无识别）")
@@ -384,8 +444,9 @@ if __name__ == '__main__':
     found_cnt  = 0
     probing    = False
     probe_end_ts = 0.0
-    lf_warmup_until = 0.0
-
+    scan_pass = 0  # 本轮“左右旋转”已完成的段数（0/1/2）
+    theta_hist = deque(maxlen=12)  # 近几帧线倾角历史（度）
+    yaw_send_hist = deque(maxlen=12)  # 近几帧实际发送给底盘的 z（deg/s）
     try:
         while True:
             # 取帧
@@ -445,12 +506,16 @@ if __name__ == '__main__':
                     line_following_enabled = False
                     searching = probing = False
                     found_cnt = 0
-
-                    handle_marker_flow(ep_robot, motion, marker_mgr, ep_camera)
-                    reset_line_state_after_green(ep_robot, ep_gimbal)
-                    time.sleep(1.0)
-                    line_following_enabled = True
-                    t_ignore_red_until = time.time() + 1.2
+                    prev_chassis = marker_mgr.ep_chassis
+                    marker_mgr.ep_chassis = None  # 禁用“底盘兜底转向”
+                    try:
+                        handle_marker_flow(ep_robot, motion, marker_mgr, ep_camera)
+                        reset_line_state_after_green(ep_robot, ep_gimbal)
+                        time.sleep(1.0)
+                        line_following_enabled = True
+                        t_ignore_red_until = time.time() + 1.2
+                    finally:
+                        marker_mgr.ep_chassis = prev_chassis
                     continue
 
                 # 可视化叠加
@@ -486,79 +551,112 @@ if __name__ == '__main__':
 
             else:
                 if line_center is not None:
-                    # 若处于探前/扫描，两帧稳定确认再退出（保持当前探前/扫描动作）
                     if searching or probing:
                         found_cnt += 1
                         if found_cnt < FOUND_STABLE_FRAMES:
+                            # 继续当前动作：探前或旋转（不改模式）
                             if searching:
                                 motion.send(0.0, sweep_dir * SEARCH_YAW_DPS)
                             elif probing:
                                 motion.send(PROBE_FWD_SPEED, 0.0)
                         else:
+                            # —— 确认找回线，收尾 —— #
                             searching = probing = False
                             found_cnt = 0
+                            scan_pass = 0
+                            motion.soft_stop()
                             print("[SEARCH] 蓝线已找到，恢复巡线")
 
                     # 正常巡线
                     x_cmd, z_cmd = line_following_control(line_center, W)
-
-                    # 暖机期（复位后 0.25s）对 z_cmd 做软限幅，避免第一帧爆冲
-                    if time.monotonic() < lf_warmup_until:
-                        MAX_WARMUP_Z = 60.0  # 你也可用 50~80 之间
-                        z_cmd = np.clip(z_cmd, -MAX_WARMUP_Z, +MAX_WARMUP_Z)
-
                     motion.send(x_cmd, -z_cmd)
-
+                    theta = estimate_line_theta_deg(mask)
+                    if theta is not None:
+                        theta_hist.append(theta)
+                    yaw_send_hist.append(-z_cmd)
                     rate.log("speed", f"底盘前进速度: {x_cmd:.2f} m/s, 转向速度: {z_cmd:.1f}°/s", 1.0)
 
-                else:
-                    # 当前帧没看到线
-                    if not search_guard:
-                        now = time.monotonic()
-                        if searching or probing:
-                            # 第一次掉守卫，记时；在 HYST 窗口内继续保持当前动作，不立即取消
-                            guard_drop_ts = guard_drop_ts or now
-                            if now - guard_drop_ts < SEARCH_GUARD_HYST:
-                                # 继续当前动作（避免被“瞬时抖动”打断）
-                                if searching:
-                                    motion.send(0.0, sweep_dir * SEARCH_YAW_DPS)
-                                elif probing:
-                                    motion.send(PROBE_FWD_SPEED, 0.0)
-                                continue
-                        # 超过 HYST 仍不允许 → 才真正取消
-                        guard_drop_ts = None
-                        searching = probing = False
-                        found_cnt = 0
-                        motion.soft_stop()
-                        rate.log("no_line", "未检测到蓝线，保持静止（柔性停）", 1.2)
 
+
+                else:
+
+                    # 当前帧没看到线
+
+                    if not search_guard:
+
+                        now = time.monotonic()
+
+                        if searching or probing:
+
+                            # HYST：短暂允许继续当前动作，避免抖动打断
+
+                            guard_drop_ts = guard_drop_ts or now
+
+                            if now - guard_drop_ts < SEARCH_GUARD_HYST:
+
+                                if searching:
+
+                                    motion.send(0.0, sweep_dir * SEARCH_YAW_DPS)
+
+                                elif probing:
+
+                                    motion.send(PROBE_FWD_SPEED, 0.0)
+
+                                continue
+
+                        # 超过 HYST → 取消当前“探前/旋转”，静止
+
+                        guard_drop_ts = None
+
+                        searching = probing = False
+
+                        found_cnt = 0
+
+                        scan_pass = 0
+
+                        motion.soft_stop()
+
+                        rate.log("no_line", "未检测到蓝线，保持静止（柔性停）", 1.2)
                     else:
-                        # 允许搜索：先探前 → 再扫描（全部用柔性速度）
+                        # ============ 允许搜索：前进一小段 → 停车 → 左右旋转（两段） ============
+                        HALF_SEG_TIME = 0.5 * SEARCH_SEG_TIME  # 左/右各半程，共覆盖 SEARCH_SWEEP_DEG
                         if not searching and not probing:
                             guard_drop_ts = None
                             probing = True
                             probe_end_ts = time.time() + PROBE_FWD_TIME
-                            print(f"[SEARCH] 丢线 → 先直行 {PROBE_FWD_TIME:.2f}s，再扫描")
+                            print(f"[SEARCH] 丢线 → 先直行 {PROBE_FWD_TIME:.2f}s，再左右旋转寻找")
 
                         if probing:
                             if time.time() < probe_end_ts:
                                 motion.send(PROBE_FWD_SPEED, 0.0)
                             else:
-                                probing   = False
+                                # 停车，转入“左右旋转”
+                                motion.soft_stop()
+                                probing = False
                                 searching = True
-                                sweep_dir = -sweep_dir
-                                seg_end_ts = time.time() + SEARCH_SEG_TIME
-                                found_cnt = 0
-                                print("[SEARCH] 探前结束 → 开始左右各 90° 扫描")
+                                scan_pass = 0
+
+                                sweep_dir = pick_first_sweep_dir()  # ☆ 用预测方向替代固定 -1
+                                seg_end_ts = time.time() + HALF_SEG_TIME
                                 motion.send(0.0, sweep_dir * SEARCH_YAW_DPS)
 
                         elif searching:
                             if time.time() < seg_end_ts:
+                                # 继续保持恒速旋转
                                 motion.send(0.0, sweep_dir * SEARCH_YAW_DPS)
                             else:
+                                # 完成一段，反向；累计段数
+                                scan_pass += 1
                                 sweep_dir *= -1
-                                seg_end_ts = time.time() + SEARCH_SEG_TIME
-                                motion.send(0.0, sweep_dir * SEARCH_YAW_DPS)
+                                if scan_pass >= 2:
+                                    # 左右两段都扫完仍没找到 → 本轮结束，下一轮会再次“前进一小段”
+                                    searching = False
+                                    motion.soft_stop()
+                                    time.sleep(0.05)  # 小憩让底盘稳住
+                                else:
+                                    # 还有另一段：继续
+                                    seg_end_ts = time.time() + HALF_SEG_TIME
+                                    motion.send(0.0, sweep_dir * SEARCH_YAW_DPS)
 
             # 面板显示
             try:

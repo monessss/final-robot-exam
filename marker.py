@@ -1,29 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-MarkerCaptureManager —— 增强版（可直接替换你当前的 marker.py）
-包含：
-1) 云台/底盘跟随（闭环居中）
-2) 拍照后回正（可配）
-3) 相机暖机与掉线自动重连
-4) gimbal 角度订阅与回正闭环等待
-5) 异步拍照（不阻塞主循环）+ 目标粘性/已拍忽略 + 可视化叠加
-
-用法（主程序示例）：
-    from marker import MarkerCaptureManager
-    mgr = MarkerCaptureManager(ep_robot, ep_camera, ep_vision, ep_chassis,
-                               show_debug=True, save_dir="shots")
-    mgr.subscribe()            # 订阅 marker 与 gimbal 角度
-    mgr.start_stream_with_warmup()
-
-    while True:
-        # 你可以让类自己取帧，也可以把你主循环的帧传给它
-        frame, target, stage, save_path = mgr.step(frame=None, draw=True)
-        # 若你主循环里还有红灯/巡线/避障——注意优先级编排即可
-
-注意：
-- 若你的 SDK 不支持 read_cv2_image(strategy="newest"), 本类会自动回退到 read_cv2_image(timeout=...)
-- 若你的 SDK 不支持 camera.start_video_stream 的 bitrate/fps参数，会自动多级回退
+MarkerCaptureManager —— 稳定版（最近优先 + 连帧投票 + 双迟滞 + 锁不轻易掉）
+要点：
+- 统一评分：支持 prefer_nearest_by={"area","center","hybrid"}，避免“选/切”标准不一致
+- 锁保留：only_near=True 时，锁定目标即便暂时不 near 也继续参与“跟随”（仅影响能否拍）
+- 切换条件：最小间隔 + 面积迟滞 + 中心迟滞 + 连续K帧胜出（大幅降低乒乓抖动）
+- 去掉重复的拍照触发 if
 """
+
 import os
 import cv2
 import time
@@ -65,10 +49,14 @@ class MarkerCaptureManager:
                  min_yaw_dps: float = 5.0,
                  deadband_dps: float = 1.0,
                  dir_yaw: float = +1.0,             # 方向反了可以改成 -1
-                 smooth_alpha: float = 0.35,  # 轨迹 EMA 平滑
-                 track_hold_sec: float = 1.20,
-                 lock_min_dwell: float = 1.00,
-                 lost_grace_sec: float = 0.80,  # ↑ 丢失宽限（0.8s 内不换目标）
+                 smooth_alpha: float = 0.35,        # 轨迹 EMA 平滑
+                 track_hold_sec: float = 0.50,      # 轨迹保留
+                 # —— 多目标与超时 ——
+                 min_switch_interval_s: float = 0.50,   # 两次“切目标”的最小间隔
+                 area_switch_hysteresis: float = 1.20,  # 面积明显更好比例阈值
+                 capture_deadline_s: float = 1.00,      # 锁定同一ID超过该时长仍未拍，则强制拍
+                 force_capture_if_near: bool = False,    # 强拍是否要求 near
+
                  # —— 拍照/回正 ——
                  pre_capture_delay: float = 0.50,
                  recenter_after_capture: bool = True,
@@ -88,7 +76,15 @@ class MarkerCaptureManager:
                  show_debug: bool = False,
                  save_dir: str = 'shots',
                  window_name: str = 'Markers',
-                 valid_id_range: Tuple[int, int] = (1, 5)):
+                 valid_id_range: Tuple[int, int] = (1, 5),
+                 # —— 新增：像素面积过滤/最近优先策略 ——
+                 min_area_px: Optional[int] = 12000,       # 像素面积阈值
+                 min_area_norm: Optional[float] = None,    # 无像素尺寸时的归一化面积阈值
+                 prefer_nearest_by: str = "area",          # 'area' | 'center' | 'hybrid'
+                 # —— 新增：稳定切换参数 ——
+                 center_switch_hysteresis: float = 1.10,   # 中心明显更好比例（越大越严格）
+                 switch_vote_frames: int = 3               # 连续赢的帧数，才真正切换
+                 ):
         self.ep_robot = ep_robot
         self.ep_camera = ep_camera
         self.ep_vision = ep_vision
@@ -123,9 +119,19 @@ class MarkerCaptureManager:
         self.show_debug = show_debug
         self.window_name = window_name
         self.valid_id_range = valid_id_range
-        self.lock_min_dwell = float(lock_min_dwell)
-        self.lost_grace_sec = float(lost_grace_sec)
-        self._lock_since: float = 0.0  # 当前这次锁定起始时间
+
+        # 新增：面积过滤/策略参数
+        self.min_area_px = min_area_px
+        self.min_area_norm = min_area_norm
+        self.prefer_nearest_by = prefer_nearest_by.lower().strip()
+        if self.prefer_nearest_by not in ("area", "center", "hybrid"):
+            self.prefer_nearest_by = "area"
+
+        # 稳定切换参数
+        self.center_switch_hysteresis = float(center_switch_hysteresis)
+        self.switch_vote_frames = int(switch_vote_frames)
+        self._switch_votes = 0
+
         # 跟随/状态量
         self.gimbal_yaw: Optional[float] = None
         self.gimbal_pitch: Optional[float] = None
@@ -141,6 +147,7 @@ class MarkerCaptureManager:
         # 读帧/暖机
         self._miss = 0
         self._stream_ready = False
+        self._last_frame_size: Optional[Tuple[int, int]] = None  # (w, h)
 
         # 拍照线程
         self._cap_thread: Optional[threading.Thread] = None
@@ -152,6 +159,13 @@ class MarkerCaptureManager:
         # 日志
         self._last_cmd_log_t = 0.0
         self._last_cmd_info = "IDLE"
+        self.min_switch_interval_s = min_switch_interval_s
+        self.area_switch_hysteresis = area_switch_hysteresis
+        self.capture_deadline_s = capture_deadline_s
+        self.force_capture_if_near = force_capture_if_near
+
+        self._lock_since: float = 0.0
+        self._last_switch_ts: float = 0.0
 
         if self.show_debug:
             cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
@@ -274,8 +288,7 @@ class MarkerCaptureManager:
                     continue
                 with self._tracks_lock:
                     if mid not in self._tracks:
-                        self._tracks[mid] = {'x': x, 'y': y, 'w': w, 'h': h,
-                                             'ts': now, 'first_ts': now}
+                        self._tracks[mid] = {'x': x, 'y': y, 'w': w, 'h': h, 'ts': now}
                     else:
                         t = self._tracks[mid]
                         a = self.smooth_alpha
@@ -283,7 +296,7 @@ class MarkerCaptureManager:
                         t['y'] = a * y + (1 - a) * t['y']
                         t['w'] = a * w + (1 - a) * t['w']
                         t['h'] = a * h + (1 - a) * t['h']
-                        t['ts'] = now  # 保留 first_ts 不变（用于“第一个出现”的判断）
+                        t['ts'] = now
         except Exception:
             pass
 
@@ -301,6 +314,50 @@ class MarkerCaptureManager:
         except Exception:
             pass
 
+    # -------------------- 面积计算与过滤（新增） --------------------
+    def _area_px_from_norm(self, w_norm: float, h_norm: float) -> Optional[float]:
+        """把归一化宽高换算为像素面积；若未知分辨率则返回 None。"""
+        if self._last_frame_size is None:
+            return None
+        fw, fh = self._last_frame_size
+        return max(0.0, w_norm * fw * h_norm * fh)
+
+    def _passes_area(self, m: MarkerInfo) -> bool:
+        """优先用像素阈值过滤；若没有像素尺寸，退化用归一化面积阈值。"""
+        # 像素阈值优先
+        if self.min_area_px is not None:
+            area_px = self._area_px_from_norm(m.w, m.h)
+            if area_px is not None:
+                return area_px >= float(self.min_area_px)
+            # 无像素尺寸则继续看归一化
+        if self.min_area_norm is not None:
+            return (m.w * m.h) >= float(self.min_area_norm)
+        # 若两种阈值都未设置，默认放行
+        return True
+
+    def _area_metric(self, m: MarkerInfo) -> float:
+        """作为‘距离/近远’的 proxy：像素面积优先，其次归一化面积。越大越近。"""
+        area_px = self._area_px_from_norm(m.w, m.h)
+        if area_px is not None:
+            return area_px
+        return (m.w * m.h)
+
+    # ==================== 统一评分（越大越好） ====================
+    def _score_for_selection(self, m: MarkerInfo) -> tuple:
+        """
+        返回一个用于比较的“越大越好”评分元组。
+        area 优先： (面积代理, -中心误差)
+        center 优先：(-中心误差, 面积代理)
+        hybrid：     (面积代理, -中心误差)
+        """
+        area = self._area_metric(m)          # 像素面积优先，退化到归一化面积
+        center = -abs(m.x - 0.5)             # 越靠中心值越大
+        if self.prefer_nearest_by == "center":
+            return (center, area)
+        else:
+            # "area" 或 "hybrid"
+            return (area, center)
+
     # -------------------- 目标选择/判定 --------------------
     def _stable_markers(self) -> List[MarkerInfo]:
         now = time.time()
@@ -313,38 +370,79 @@ class MarkerCaptureManager:
 
     def _choose_target(self, stable: List[MarkerInfo]) -> Optional[MarkerInfo]:
         now = time.time()
-        # 1) 过滤：已拍/距离（只取候选）
-        candidates = [m for m in stable if int(m.mid) not in self._captured_ids]
-        if self.only_near:
-            candidates = [m for m in candidates if m.w >= self.near_width_min]
-
-        # 2) 若当前有锁：
-        if self._locked_id is not None:
-            # 2.1 锁定 ID 仍在候选里 → 继续保持（更新时间戳）
-            for m in candidates:
-                if int(m.mid) == int(self._locked_id):
-                    self._last_lock_ts = now
-                    # 未达到最小占用时长前，无条件继续使用该目标
-                    return m
-            # 2.2 锁定 ID 暂不在候选里 → 宽限时间内不换目标
-            if (now - self._last_lock_ts) <= self.lost_grace_sec:
-                return None
-            # 2.3 超过宽限 → 允许重新选择
-            self._locked_id = None
-
-        # 3) 没有锁或锁失效：按“first_ts 最早（第一个出现）”选择
-        if not candidates:
+        if not stable:
             return None
 
-        def first_ts_of(mid: int) -> float:
-            t = self._tracks.get(int(mid), {})
-            return t.get('first_ts', float('inf'))
+        stable_map = {int(m.mid): m for m in stable}
 
-        m = min(candidates, key=lambda k: first_ts_of(k.mid))
-        self._locked_id = int(m.mid)
-        self._lock_since = now
-        self._last_lock_ts = now
-        return m
+        # 忽略已拍 ID
+        candidates = [m for m in stable if int(m.mid) not in self._captured_ids]
+
+        # near 过滤（拍照候选）；但“当前锁定”即使不 near，也应参与跟随候选
+        if self.only_near:
+            near_candidates = [m for m in candidates if m.w >= self.near_width_min]
+        else:
+            near_candidates = candidates
+
+        # 面积阈值过滤（可选）
+        if self.min_area_px is not None or self.min_area_norm is not None:
+            near_candidates = [m for m in near_candidates if self._passes_area(m)]
+
+        locked: Optional[MarkerInfo] = None
+        if self._locked_id is not None and int(self._locked_id) in stable_map:
+            locked = stable_map[int(self._locked_id)]
+            # 锁定目标即使被 near 过滤掉，也补回用于“继续跟随”
+            if self.only_near and locked not in near_candidates:
+                near_candidates = near_candidates + [locked]
+
+        if not near_candidates:
+            return None
+
+        # 统一评分择优（越大越好）
+        best = max(near_candidates, key=self._score_for_selection)
+
+        # 无锁：上锁
+        if locked is None:
+            self._locked_id = int(best.mid)
+            self._lock_since = now
+            self._last_switch_ts = now
+            self._last_lock_ts = now
+            self._switch_votes = 0
+            return best
+
+        # 有锁：仅在满足“最小间隔 + 双迟滞 + 连帧投票”时才切换
+        area_locked = max(self._area_metric(locked), 1e-6)
+        area_best   = max(self._area_metric(best),   1e-6)
+        # 中心误差越小越好 => locked/best 的误差比越大，说明 best 在居中上明显更好
+        center_locked_err = max(abs(locked.x - 0.5), 1e-6)
+        center_best_err   = max(abs(best.x   - 0.5), 1e-6)
+
+        area_gain   = area_best / area_locked
+        center_gain = center_locked_err / center_best_err
+        interval_ok = (now - self._last_switch_ts) >= self.min_switch_interval_s
+
+        if (best.mid != locked.mid) and interval_ok and \
+           (area_gain >= self.area_switch_hysteresis) and \
+           (center_gain >= self.center_switch_hysteresis):
+            # 本帧竞争者判胜：增加投票
+            self._switch_votes += 1
+            if self._switch_votes >= self.switch_vote_frames:
+                # 真正切换
+                self._locked_id = int(best.mid)
+                self._lock_since = now
+                self._last_switch_ts = now
+                self._last_lock_ts = now
+                self._switch_votes = 0
+                return best
+            else:
+                # 还没累满票，保持原锁
+                self._last_lock_ts = now
+                return locked
+        else:
+            # 不满足切换条件：清零投票，保持原锁
+            self._switch_votes = 0
+            self._last_lock_ts = now
+            return locked
 
     def _ready_for_capture(self, target: MarkerInfo) -> bool:
         if time.time() < self._cooldown_until:
@@ -416,6 +514,9 @@ class MarkerCaptureManager:
             if frame is None:
                 return
             h, w = frame.shape[:2]
+            # 记录分辨率，供面积像素计算
+            self._last_frame_size = (w, h)
+
             # 取拍照时刻的目标（尽量从最新轨迹估算）
             with self._tracks_lock:
                 t = self._tracks.get(mid)
@@ -466,6 +567,9 @@ class MarkerCaptureManager:
     # -------------------- 可视化 --------------------
     def _draw_overlays(self, img, stable: List[MarkerInfo], target: Optional[MarkerInfo]):
         h, w = img.shape[:2]
+        # 记录分辨率，供面积像素计算
+        self._last_frame_size = (w, h)
+
         for m in stable:
             x1 = int((m.x - m.w/2) * w); y1 = int((m.y - m.h/2) * h)
             x2 = int((m.x + m.w/2) * w); y2 = int((m.y + m.h/2) * h)
@@ -475,8 +579,15 @@ class MarkerCaptureManager:
             cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
             cx, cy = int(m.x * w), int(m.y * h)
             cv2.circle(img, (cx, cy), 4, color, -1)
-            label = f"Team 20 detect a marker with ID {m.mid} w={m.w:.2f}"
+
+            # 面积标注：像素优先，否则显示归一化面积
+            area_px = self._area_px_from_norm(m.w, m.h)
+            if area_px is not None:
+                label = f"ID {m.mid} w={m.w:.2f} Apx={int(area_px)}"
+            else:
+                label = f"ID {m.mid} w={m.w:.2f} An={m.w*m.h:.4f}"
             cv2.putText(img, label, (x1, max(18, y1-6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
         # 中心十字
         cx = int(0.5 * w); cy = int(0.5 * h)
         cv2.drawMarker(img, (cx, cy), (255, 255, 255), markerType=cv2.MARKER_CROSS, thickness=2)
@@ -503,6 +614,10 @@ class MarkerCaptureManager:
         if frame is None:
             return None, None, 'IDLE', None
 
+        # 记录分辨率（供像素面积计算）
+        h, w = frame.shape[:2]
+        self._last_frame_size = (w, h)
+
         # 稳定轨迹
         stable = self._stable_markers()
         target = self._choose_target(stable)
@@ -515,16 +630,24 @@ class MarkerCaptureManager:
             self._send_yaw(yaw_speed_norm)
             stage = 'FOLLOW'
 
-            # 触发拍照
+            # 触发拍照（去重：只保留一次）
             if self._ready_for_capture(target):
                 self._capture_async(int(target.mid))
                 stage = 'CAPTURING'
+            else:
+                # —— 超时强拍：锁定同一ID超过 capture_deadline_s 仍未拍 ——
+                if (self.capture_deadline_s is not None) and (self._lock_since > 0):
+                    if (time.time() - self._lock_since) >= self.capture_deadline_s:
+                        if (not self.force_capture_if_near) or (target.w >= self.near_width_min):
+                            self._capture_async(int(target.mid))
+                            stage = 'CAPTURING'
         else:
             # 锁丢失策略：短保留，否则清空
             if self._locked_id and time.time() - self._last_lock_ts <= self.track_hold_sec:
                 pass
             else:
                 self._locked_id = None
+                self._lock_since = 0.0
 
         # 可视化
         if draw and self.show_debug:
