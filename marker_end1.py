@@ -1,29 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-MarkerCaptureManager —— 增强版（可直接替换你当前的 marker_end1.py）
-包含：
-1) 云台/底盘跟随（闭环居中）
-2) 拍照后回正（可配）
-3) 相机暖机与掉线自动重连
-4) gimbal 角度订阅与回正闭环等待
-5) 异步拍照（不阻塞主循环）+ 目标粘性/已拍忽略 + 可视化叠加
-
-用法（主程序示例）：
-    from marker import MarkerCaptureManager
-    mgr = MarkerCaptureManager(ep_robot, ep_camera, ep_vision, ep_chassis,
-                               show_debug=True, save_dir="shots")
-    mgr.subscribe()            # 订阅 marker 与 gimbal 角度
-    mgr.start_stream_with_warmup()
-
-    while True:
-        # 你可以让类自己取帧，也可以把你主循环的帧传给它
-        frame, target, stage, save_path = mgr.step(frame=None, draw=True)
-        # 若你主循环里还有红灯/巡线/避障——注意优先级编排即可
-
-注意：
-- 若你的 SDK 不支持 read_cv2_image(strategy="newest"), 本类会自动回退到 read_cv2_image(timeout=...)
-- 若你的 SDK 不支持 camera.start_video_stream 的 bitrate/fps参数，会自动多级回退
-"""
 import os
 import cv2
 import time
@@ -655,4 +629,5 @@ class MarkerCaptureManager:
         except Exception:
             pass
         if self.show_debug:
+
             cv2.destroyWindow(self.window_name)
