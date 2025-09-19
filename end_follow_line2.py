@@ -8,7 +8,7 @@ import os
 from robomaster import robot
 
 # ======= 控制器（保持你现有的工具类）=======
-from RedLight3 import RedLightController
+from RedLight import RedLightController
 from marker_end1 import MarkerCaptureManager
 
 # ---------------- 调参 ----------------
@@ -409,3 +409,4 @@ if __name__ == '__main__':
             ep_robot.close()
         except Exception:
             pass
+
