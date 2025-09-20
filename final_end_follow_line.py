@@ -1,0 +1,406 @@
+
+import time
+import cv2
+import numpy as np
+import os
+from robomaster import robot
+
+from final_RedLight import RedLightController
+from final_marker_end import MarkerCaptureManager
+
+LOWER_BLUE   = np.array([100, 101, 30], dtype=np.uint8)
+UPPER_BLUE   = np.array([140, 255, 255], dtype=np.uint8)
+
+KP_LINE      = 1.0
+Z_GAIN       = 80.0
+BASE_SPEED   = 0.35
+PITCH_ANGLE  = -50
+
+WINDOW_NAME = "RM View"
+PANEL_W, PANEL_H = 960, 360
+line_following_enabled = True
+
+SEARCH_YAW_DPS       = 60.0
+SEARCH_SWEEP_DEG     = 120.0
+FOUND_STABLE_FRAMES  = 2
+SEARCH_SEG_TIME      = SEARCH_SWEEP_DEG / abs(SEARCH_YAW_DPS)
+PROBE_FWD_TIME       = 0.5
+PROBE_FWD_SPEED      = 0.1
+
+
+class MotionSmoother:
+    def __init__(self, chassis, x_slew=0.15, z_slew=40.0, timeout=0.12):
+        self.chassis = chassis
+        self.x_cur = 0.0
+        self.z_cur = 0.0
+        self.x_slew = float(x_slew)
+        self.z_slew = float(z_slew)
+        self.timeout = float(timeout)
+
+    @staticmethod
+    def _step(cur, tgt, step):
+        if tgt > cur:  return min(cur + step, tgt)
+        if tgt < cur:  return max(cur - step, tgt)
+        return cur
+
+    def send(self, x_target: float, z_target: float):
+        self.x_cur = self._step(self.x_cur, x_target, self.x_slew)
+        self.z_cur = self._step(self.z_cur, z_target, self.z_slew)
+        try:
+            self.chassis.drive_speed(x=self.x_cur, y=0, z=self.z_cur, timeout=self.timeout)
+        except Exception:
+            pass
+
+    def soft_stop(self):
+        self.send(0.0, 0.0)
+
+    def hard_zero(self):
+        self.x_cur, self.z_cur = 0.0, 0.0
+        try:
+            self.chassis.drive_speed(x=0, y=0, z=0, timeout=self.timeout)
+        except Exception:
+            pass
+
+redlight_ctrl = None
+
+class RateLimiter:
+    def __init__(self):
+        self.last = {}
+    def log(self, key: str, msg: str, min_interval: float = 1.0):
+        now = time.time()
+        t = self.last.get(key, 0.0)
+        if now - t >= min_interval:
+            print(msg)
+            self.last[key] = now
+
+rate = RateLimiter()
+
+SHOOT_DIR = os.path.join(os.path.dirname(__file__), "shots")
+os.makedirs(SHOOT_DIR, exist_ok=True)
+
+def dump_marker_diag(marker_mgr, stage_hint=""):
+    return
+
+def init_robot():
+    ep_robot = robot.Robot()
+    ep_robot.initialize(conn_type="ap")
+
+    ep_camera = ep_robot.camera
+    ep_chassis = ep_robot.chassis
+    ep_gimbal  = ep_robot.gimbal
+    ep_vision  = ep_robot.vision
+
+    try:
+        print("设置机器人模式为底盘跟随云台(chassis_lead)...")
+        ep_robot.set_robot_mode(mode='chassis_lead')
+        ep_gimbal.recenter(pitch_speed=60, yaw_speed=60).wait_for_completed()
+        time.sleep(0.3)
+        ep_gimbal.move(pitch=PITCH_ANGLE, yaw=0, pitch_speed=30, yaw_speed=30).wait_for_completed()
+        time.sleep(0.3)
+    except Exception as e:
+        print(f"[init] 云台设置异常: {e}")
+
+    global redlight_ctrl
+    redlight_ctrl = RedLightController(show_debug=True)
+    redlight_ctrl.ep = ep_robot
+    redlight_ctrl.ep_gimbal = ep_gimbal
+    redlight_ctrl.ep_camera = ep_camera
+    redlight_ctrl.mode_state = 3
+    if hasattr(redlight_ctrl, "_last_state"):  redlight_ctrl._last_state = 3
+    if hasattr(redlight_ctrl, "detect_state"): redlight_ctrl.detect_state = 3
+
+    return ep_robot, ep_camera, ep_chassis, ep_gimbal, ep_vision
+
+def read_newest(cam, timeout=0.3):
+    try:
+        return cam.read_cv2_image(strategy="newest", timeout=timeout)
+    except Exception:
+        try:
+            return cam.read_cv2_image(timeout=timeout)
+        except Exception:
+            return None
+
+class FrameGrabber:
+    def __init__(self, cam):
+        self.cam = cam
+        self.last = None
+    def grab(self, retries=6, timeout=0.10, allow_last=True):
+        for _ in range(max(1, retries)):
+            try:
+                f = read_newest(self.cam, timeout=timeout)
+            except Exception:
+                f = None
+            if f is not None:
+                self.last = f
+                return f
+        if allow_last and self.last is not None:
+            return self.last
+        return None
+    def flush(self, n=4, timeout=0.03):
+        for _ in range(max(0, n)):
+            _ = read_newest(self.cam, timeout=timeout)
+
+def detect_blue_line(img_bgr):
+    H, W = img_bgr.shape[:2]
+    y0 = int(H * 0.55)
+    roi = img_bgr[y0:, :]
+    hsv  = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, LOWER_BLUE, UPPER_BLUE)
+    kernel = np.ones((4, 4), np.uint8)
+    mask = cv2.erode(mask, kernel, iterations=1)
+    mask = cv2.dilate(mask, kernel, iterations=2)
+    contours, _ = cv2.findContours(mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        c  = max(contours, key=cv2.contourArea)
+        x, y, w, h = cv2.boundingRect(c)
+        cx = x + w // 2
+        cv2.rectangle(img_bgr, (x, y + y0), (x + w, y + h + y0), (255, 0, 0), 2)
+        cv2.circle(img_bgr, (cx, y0 + y + h // 2), 5, (0, 0, 255), -1)
+        return cx, mask
+    return None, mask
+
+def line_following_control(line_center_x, image_width):
+    error = (image_width // 2) - line_center_x
+    turn  = KP_LINE * error / (image_width // 2)
+    z_dps = turn * Z_GAIN
+    return BASE_SPEED, z_dps
+
+def reset_line_state_after_green(ep_robot, ep_gimbal):
+    try:
+        ep_robot.set_robot_mode(mode='chassis_lead')
+        time.sleep(1.0)
+    except Exception as e:
+        rate.log("mode_warn", f"[WARN] 设置 chassis_lead 异常：{e}", 2.0)
+    try:
+        ep_gimbal.recenter(pitch_speed=60, yaw_speed=60).wait_for_completed()
+        time.sleep(0.1)
+        ep_gimbal.move(pitch=PITCH_ANGLE, yaw=0, pitch_speed=30, yaw_speed=30).wait_for_completed()
+        time.sleep(0.1)
+    except Exception as e:
+        rate.log("rl_restore", f"[WARN] 恢复巡线时云台设置异常：{e}", 2.0)
+    global line_following_enabled
+    line_following_enabled = True
+
+def handle_redlight_flow(ep_robot, motion: MotionSmoother):
+    rate.log("rl_enter", "[红灯] 暂停巡线，进入 RedLight 流程...", 1.0)
+    motion.soft_stop()
+    while True:
+        try:
+            det_state, mode_state, _ = redlight_ctrl.step()
+        except Exception as e:
+            print(f"[redlight] step 异常：{e}")
+            det_state, mode_state = 3, 3
+        motion.soft_stop()
+        if mode_state == 3:
+            rate.log("rl_exit", "[绿灯] RedLight 流程结束，准备统一复位...", 1.0)
+            break
+
+# ========= 稳定补丁版 Marker 拍照流程 =========
+def handle_marker_flow(ep_robot, motion: MotionSmoother, marker_mgr, ep_camera):
+    print("[marker] 暂停巡线，进入 Marker 拍照流程…")
+
+    try:
+        ep_robot.set_robot_mode(mode='free')
+        time.sleep(0.08)
+    except Exception:
+        pass
+    motion.soft_stop()
+
+    save_path = None
+    idle_frames = 0
+    start_time = time.time()
+    MAX_TOTAL_TIMEOUT = 12.0  # 整个流程最长 12 秒
+
+    while True:
+        if time.time() - start_time > MAX_TOTAL_TIMEOUT:
+            print("[marker] !!! 超时强制退出，避免卡死 !!!")
+            break
+
+        frame = grabber.grab(retries=6, timeout=0.10, allow_last=True)
+        if frame is None:
+            motion.soft_stop()
+            rate.log("mk_frame", "[marker] 暂无可用帧", 0.5)
+            continue
+
+        try:
+            _, target, stage, save_path = marker_mgr.step(frame=frame, draw=True)
+        except Exception as e:
+            print(f"[marker] step 异常：{e}")
+            target, stage, save_path = None, "IDLE", None
+
+        motion.soft_stop()
+
+        if target is not None:
+            rate.log("mk_lock", f"[marker] stage={stage} id={getattr(target, 'mid', -1)}", 0.3)
+            idle_frames = 0
+        else:
+            idle_frames += 1
+
+        if save_path is not None:
+            print(f"[marker] 本轮拍照完成：{os.path.basename(save_path)}")
+            try:
+                marker_mgr.ep_gimbal.drive_speed(pitch_speed=0, yaw_speed=0)
+            except Exception:
+                pass
+
+            try:
+                t0 = time.time()
+                while getattr(marker_mgr, "_cap_active", False) and time.time() - t0 < 3.0:
+                    motion.soft_stop()
+                    time.sleep(0.05)
+            except Exception as e:
+                print(f"[marker] 等待内部回正异常: {e}")
+
+            try:
+                grabber.flush(n=12, timeout=0.02)
+            except Exception:
+                pass
+            break
+
+    try:
+        marker_mgr._locked_id = None
+        marker_mgr._cooldown_until = time.time() + 2.5
+    except Exception:
+        pass
+
+if __name__ == '__main__':
+    try:
+        cv2.setNumThreads(1)
+    except Exception:
+        pass
+
+    ep_robot, ep_camera, ep_chassis, ep_gimbal, ep_vision = init_robot()
+    grabber = FrameGrabber(ep_camera)
+    motion = MotionSmoother(ep_chassis)
+
+    try:
+        ep_camera.start_video_stream(display=False)
+        time.sleep(0.8)
+    except Exception as e:
+        print(f"[cam] start_video_stream 警告：{e}")
+
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+
+    marker_mgr = MarkerCaptureManager(
+        ep_robot=ep_robot, ep_camera=ep_camera, ep_vision=ep_vision, ep_chassis=ep_chassis,
+        show_debug=False, window_name="Markers",
+        only_near=True, near_width_min=0.10, track_width_min=0.06,
+        center_tol=0.07, width_thresh_norm=0.08,
+        kp_yaw=0.35, max_yaw_dps=45.0,
+        deadband_dps=3.0,
+        recenter_after_capture=False, miss_restart=999999,
+        save_dir=SHOOT_DIR
+    )
+    try:
+        marker_mgr.subscribe()
+    except Exception as e:
+        print(f"[marker] subscribe 警告：{e}")
+
+    frame_id = 0
+    mk_last_stage = "IDLE"
+    t_ignore_red_until = 0.0
+
+    searching  = False
+    sweep_dir  = +1
+    seg_end_ts = 0.0
+    found_cnt  = 0
+    probing    = False
+    probe_end_ts = 0.0
+    lf_warmup_until = 0.0
+
+    try:
+        while True:
+            frame = grabber.grab(retries=3, timeout=0.06, allow_last=True)
+            if frame is None:
+                motion.soft_stop()
+                continue
+
+            frame_id += 1
+            H, W = frame.shape[:2]
+            vis = frame.copy()
+
+            det_state = 3
+            try:
+                det_state = redlight_ctrl._detect_color_state(frame, draw=vis)
+            except Exception as e:
+                rate.log("rl_detect_err", f"[redlight] _detect_color_state 异常：{e}", 1.0)
+                det_state = 3
+
+            if det_state == 0 and line_following_enabled and time.time() >= t_ignore_red_until:
+                line_following_enabled = False
+                searching = probing = False
+                found_cnt = 0
+                handle_redlight_flow(ep_robot, motion)
+                reset_line_state_after_green(ep_robot, ep_gimbal)
+                line_following_enabled = True
+                t_ignore_red_until = time.time() + 1.2
+                continue
+
+            line_center, mask = detect_blue_line(vis)
+
+            marker_target, marker_stage, marker_save = None, "IDLE", None
+            if line_following_enabled:
+                try:
+                    _, marker_target, marker_stage, marker_save = marker_mgr.step(frame=frame, draw=False)
+                except Exception as e:
+                    rate.log("mk_step_err", f"[marker] step 异常：{e}", 0.5)
+
+                if marker_stage != mk_last_stage:
+                    rate.log("mk_stage", f"[marker] stage: {mk_last_stage} -> {marker_stage}", 0.2)
+                    mk_last_stage = marker_stage
+
+                if marker_stage in ("FOLLOW", "CAPTURING"):
+                    line_following_enabled = False
+                    searching = probing = False
+                    found_cnt = 0
+                    handle_marker_flow(ep_robot, motion, marker_mgr, ep_camera)
+                    reset_line_state_after_green(ep_robot, ep_gimbal)
+                    time.sleep(1.0)
+                    line_following_enabled = True
+                    t_ignore_red_until = time.time() + 1.2
+                    continue
+
+                if marker_target is not None:
+                    mx, my, mw, mh = marker_target.x, marker_target.y, marker_target.w, marker_target.h
+                    x1 = int((mx - mw / 2) * W); y1 = int((my - mh / 2) * H)
+                    x2 = int((mx + mw / 2) * W); y2 = int((my + mh / 2) * H)
+                    cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 200, 255), 2)
+
+            if line_following_enabled:
+                if line_center is not None:
+                    x_cmd, z_cmd = line_following_control(line_center, W)
+                    motion.send(x_cmd, -z_cmd)
+                else:
+                    motion.soft_stop()
+
+            try:
+                mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+            except Exception:
+                mask_bgr = np.zeros_like(vis)
+            vis_show  = cv2.resize(vis,      (PANEL_W // 2, PANEL_H))
+            mask_show = cv2.resize(mask_bgr, (PANEL_W // 2, PANEL_H))
+            panel = np.hstack([vis_show, mask_show])
+            cv2.imshow(WINDOW_NAME, panel)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+    except KeyboardInterrupt:
+        print("中断，准备退出…")
+    finally:
+        try:
+            motion.hard_zero()
+        except Exception:
+            pass
+        try:
+            ep_gimbal.recenter().wait_for_completed(timeout=2)
+        except Exception:
+            pass
+        try:
+            ep_camera.stop_video_stream()
+        except Exception:
+            pass
+        cv2.destroyAllWindows()
+        try:
+            ep_robot.close()
+        except Exception:
+            pass
