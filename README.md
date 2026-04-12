@@ -1,57 +1,56 @@
 # final-robot-exam
 
-2024级中国海洋大学（OUC）中外合作计算机科学与技术专业  
-20 小组 **RoboMaster 1** 课程代码项目
+Code project for **Group 20** of the **2024 Sino-Foreign Cooperative Computer Science Program**  
+at **Ocean University of China (OUC)** for the **RoboMaster 1** course.
 
-## 项目简介
+## Project Introduction
 
-本项目为 **2024级 OUC 中外合作计科 20 小组** 的 **RoboMaster 1** 相关代码仓库，用于存放机器人课程实验、功能开发、调试与测试过程中所使用的程序代码。
+This repository is the **RoboMaster 1** code project of **Group 20** from the **2024 OUC Sino-Foreign Cooperative Computer Science Program**. It is used to store the program code developed during robot course experiments, function implementation, debugging, and testing.
 
-项目围绕 RoboMaster 平台展开，主要包含机器人基础控制、功能实现、调试验证以及课程考核相关内容。该仓库用于记录小组在项目开发过程中的代码成果，方便成员协作、版本管理和后续维护。
+The project is based on the RoboMaster platform and mainly includes robot basic control, function implementation, debugging, verification, and course assessment-related content. This repository is intended to record our group’s development results, facilitate team collaboration, support version management, and make future maintenance easier.
 
-## 项目目标
+## Project Objectives
 
-- 完成 RoboMaster 1 课程相关功能开发
-- 实现机器人基础控制与任务逻辑
-- 支持小组成员协作开发与代码管理
-- 记录课程项目开发过程与实验结果
-- 为后续展示、验收和总结提供代码基础
-
-
+- Complete the functional development required for the RoboMaster 1 course
+- Implement basic robot control and task logic
+- Support collaborative development and code management among team members
+- Record the project development process and experimental results
+- Provide a code foundation for future presentation, evaluation, and summary
 
 ## Our Robot
+
 ![Our Robot](assets/0c069241db28471bfaeea73f1a08fec.jpg)
-## 项目成员
 
-本项目由 **中国海洋大学 2024级中外合作计算机科学与技术专业 20 小组** 完成。
+## Team Members
 
+This project was completed by **Group 20** of the **2024 Sino-Foreign Cooperative Computer Science Program** at **Ocean University of China**.
 
-> -  monessss
-> -  牢大
-> -  yanshu
-> -  hercu
+> - monessss  
+> - 牢大  
+> - yanshu  
+> - hercu  
 
-## 项目内容
+## Project Content
 
-本仓库主要用于保存以下内容：
+This repository is mainly used to store the following content:
 
-- RoboMaster 机器人控制代码
-- 传感器数据读取与处理代码
-- 运动控制与任务执行逻辑
-- 调试测试代码
-- 课程实验或考核相关程序
+- RoboMaster robot control code
+- Sensor data reading and processing code
+- Motion control and task execution logic
+- Debugging and testing code
+- Course experiment or assessment-related programs
 
-如果仓库后续持续更新，也可作为小组项目开发记录与版本归档使用。
+If the repository continues to be updated, it can also serve as a development record and version archive for the group project.
 
-## 运行环境
+## Runtime Environment
 
+### Hardware Platform
 
-### 硬件平台
-- RoboMaster 机器人平台
-- 相关传感器与外设
+- RoboMaster robot platform
+- Related sensors and peripherals
 
-### 软件环境
-- 编程语言：`Python`
-- 开发工具：`VS Code `
-- 操作系统：`Windows `
+### Software Environment
 
+- Programming Language: `Python`
+- Development Tool: `VS Code`
+- Operating System: `Windows`
